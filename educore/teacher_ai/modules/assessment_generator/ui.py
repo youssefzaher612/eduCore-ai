@@ -5,6 +5,7 @@ import json
 import logging
 
 import streamlit as st
+from pydantic import ValidationError
 
 from educore.teacher_ai.core.llm_client import LLMError, LLMRateLimitError, LLMRequestError
 
@@ -19,6 +20,31 @@ from .presentation import (
 from .schemas import AssessmentRequest
 
 logger = logging.getLogger("educore.teacher.assessment_ui")
+
+
+def _missing_required_fields(subject: str | None, grade: str | None) -> list[str]:
+    """Return required assessment labels that contain no non-whitespace text."""
+    missing = []
+    if not str(subject or "").strip():
+        missing.append("subject")
+    if not str(grade or "").strip():
+        missing.append("grade")
+    return missing
+
+
+def _build_assessment_request(subject: str, grade: str, **fields):
+    """Build a validated request or return a user-facing form error."""
+    missing = _missing_required_fields(subject, grade)
+    if missing:
+        return None, "Please enter both a subject and a grade before generating the assessment."
+    try:
+        return AssessmentRequest(
+            subject=subject.strip(),
+            grade=grade.strip(),
+            **fields,
+        ), None
+    except ValidationError:
+        return None, "Some assessment details are incomplete or invalid. Check the form and try again."
 
 
 def render_assessment_page(
@@ -80,7 +106,7 @@ def render_assessment_page(
             "Number of questions",
             min_value=1,
             max_value=20,
-            value=10,
+            value=4,
         )
         total_marks = c6.number_input(
             "Total marks",
@@ -119,21 +145,24 @@ def render_assessment_page(
         st.session_state.pop("assessment_result", None)
         st.session_state.pop("assessment_error", None)
 
-        try:
-            request = AssessmentRequest(
-                subject=subject,
-                grade=grade,
-                topic=topic,
-                assessment_type=assessment_type,
-                difficulty=difficulty,
-                question_types=question_types,
-                question_count=int(question_count),
-                total_marks=float(total_marks),
-                duration_minutes=int(duration),
-                language=language,
-                additional_instructions=additional_instructions,
-            )
+        request, validation_message = _build_assessment_request(
+            subject,
+            grade,
+            topic=topic,
+            assessment_type=assessment_type,
+            difficulty=difficulty,
+            question_types=question_types,
+            question_count=int(question_count),
+            total_marks=float(total_marks),
+            duration_minutes=int(duration),
+            language=language,
+            additional_instructions=additional_instructions,
+        )
+        if validation_message:
+            st.warning(validation_message)
+            return
 
+        try:
             with st.status(
                 "Generating your assessment...",
                 expanded=True,
@@ -152,8 +181,8 @@ def render_assessment_page(
             st.session_state["assessment_result"] = result
 
         except LLMRateLimitError as exc:
-            wait = f" انتظر حوالي {int(exc.retry_after)} ثانية وجرب تاني." if exc.retry_after else " انتظر قليلًا وجرب تاني."
-            st.session_state["assessment_error"] = "خدمة الذكاء الاصطناعي عليها ضغط مؤقت." + wait
+            wait = f" انتظر حوالي {max(1, int(exc.retry_after))} ثانية وجرب تاني." if exc.retry_after else " انتظر قليلًا وجرب تاني."
+            st.session_state["assessment_error"] = "تم تجاوز حد الطلبات أو التوكنات المؤقت لدى Groq (TPM/RPM)." + wait
         except LLMRequestError as exc:
             if exc.status_code == 413:
                 st.session_state["assessment_error"] = (
@@ -165,7 +194,7 @@ def render_assessment_page(
         except (LLMError, AssessmentGenerationError) as exc:
             st.session_state["assessment_error"] = exc.message if isinstance(exc, LLMError) else str(exc)
         except Exception:
-            logger.exception("Assessment generation failed")
+            logger.warning("AI generation task=teacher_exam stage=failed error_category=internal")
             st.session_state["assessment_error"] = (
                 "تعذر إنشاء الامتحان بسبب خطأ داخلي. التفاصيل محفوظة في سجل تشغيل الواجهة."
             )
@@ -242,18 +271,25 @@ def _render_assessment_result(assessment) -> None:
                 for option in question.options:
                     st.write(f"{option.id}. {option.text}")
 
-                st.success(
-                    f"Correct answer: "
-                    f"{question.correct_answer or 'Not provided'}"
-                )
+                teacher_answer = question.model_answer or question.expected_answer
+                if teacher_answer is None:
+                    teacher_answer = question.correct_answer
+                if question.question_type.value == "essay":
+                    st.markdown("**Model answer**")
+                    st.write(teacher_answer if teacher_answer is not None else "Not provided")
+                else:
+                    st.success(
+                        f"Correct answer: {teacher_answer if teacher_answer is not None else 'Not provided'}"
+                    )
 
                 if question.explanation:
                     st.markdown("**Explanation**")
                     st.write(question.explanation)
 
-                if question.marking_scheme:
+                rubric = question.grading_rubric or question.marking_scheme
+                if rubric:
                     st.markdown("**Marking scheme**")
-                    for point in question.marking_scheme:
+                    for point in rubric:
                         st.write(
                             f"- {point.description}: "
                             f"{point.marks} marks"

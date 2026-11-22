@@ -15,6 +15,7 @@ from typing import Optional
 
 from .generator import GenerationResult, LessonGenerator
 from .quality_reviewer import QualityReport, QualityReviewer, RepairResult
+from .schemas import LessonPlan, adapt_generated_lesson_to_plan
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class PreparedLesson:
     report: QualityReport
     metadata: dict = field(default_factory=dict)
     repair: Optional[RepairResult] = None
+    lesson_plan: Optional[LessonPlan] = None
 
     @property
     def passed(self) -> bool:
@@ -38,6 +40,8 @@ class PreparedLesson:
     def to_dict(self) -> dict:
         return {
             "lesson": self.lesson,
+            "lesson_plan": (self.lesson_plan.model_dump(mode="json")
+                            if self.lesson_plan is not None else None),
             "report": self.report.to_dict(),
             "metadata": dict(self.metadata),
             "repair": None if self.repair is None else {
@@ -71,5 +75,9 @@ class LessonPreparationService:
                     lesson, request, source_material=source_material
                 )
 
+        # Keep the full lesson document used by the existing teacher UI and also
+        # provide the standalone LessonPlan contract for exports/integrations.
+        lesson_plan = adapt_generated_lesson_to_plan(lesson, request)
         return PreparedLesson(request=request, lesson=lesson, report=report,
-                              metadata=generated.metadata, repair=repair)
+                              metadata=generated.metadata, repair=repair,
+                              lesson_plan=lesson_plan)

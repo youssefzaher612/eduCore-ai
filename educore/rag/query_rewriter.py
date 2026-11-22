@@ -16,6 +16,19 @@ _CONVERSATION_FILLERS = {
     "more", "detail", "detailed", "continue", "it", "that", "this",
 }
 
+_CONTEXT_REFERENCES = re.compile(
+    r"\b(?:it|this|that|these|those|them|they|continue|again|more|why|how so)\b|"
+    r"(?:ده|دا|دي|دول|كده|كدا|كمل|كمّل|تاني|اكتر|أكتر|مش فاهم|مش فاهمه|وضح|كملي)",
+    re.IGNORECASE,
+)
+
+
+def needs_contextual_rewrite(question: str, chat_history: list[dict[str, str]] | None) -> bool:
+    """Rewrite only when a previous turn is needed to resolve the question."""
+    if not chat_history or not any(item.get("role") == "user" for item in chat_history):
+        return False
+    return bool(_CONTEXT_REFERENCES.search(question or ""))
+
 
 def _has_standalone_search_terms(text: str) -> bool:
     tokens = re.findall(r"[A-Za-z0-9]+|[\u0600-\u06ff]+", (text or "").casefold())
@@ -46,6 +59,8 @@ async def rewrite_for_retrieval(
 ) -> str:
     """Return source-aware multilingual search terms without answering the user."""
     safe_fallback = _safe_fallback(question, fallback_query, chat_history)
+    if not needs_contextual_rewrite(question, chat_history):
+        return safe_fallback
     try:
         context_block = (
             "\n\nRelevant excerpts from this course's indexed files:\n"
@@ -86,7 +101,7 @@ async def rewrite_for_retrieval(
                     ),
                 },
             ],
-            temperature=0,
+            temperature=0.1,
             max_tokens=160,
             reasoning_effort="none",
         )

@@ -7,6 +7,7 @@ The frontend is responsible for displaying citation metadata.
 
 from educore.database.models import UserRole
 from educore.rag.retriever import RetrievalResult
+from educore.config import settings
 
 
 STUDENT_SYSTEM_PROMPT = """
@@ -21,7 +22,7 @@ STUDENT_SYSTEM_PROMPT = """
 4. إذا لم تتوفر الإجابة في المصادر، قل:
    "المعلومة غير موجودة في المستندات المتاحة."
 5. لا تخترع حقائق أو أرقاماً أو أمثلة.
-6. استخدم رقم مصدر واحدًا بعد الادعاء عند الحاجة، ولا تكرر رقم المصدر أو تضع قائمة أرقام في نهاية الإجابة.
+6. استشهد بكل ادعاء منهجي بمعرّف المقطع الحرفي بصيغة [chunk:معرّف_المقطع]، ولا تخترع معرّفات.
 7. لا تكتب أسماء الملفات أو أرقام الصفحات؛ التطبيق يعرضها بشكل منفصل.
 8. لا تكرر نفس المعلومة أو نفس الاستشهاد دون داعٍ.
 9. أجب بلغة السؤال نفسها وبأسلوب يناسب طريقة المستخدم، بما فيها اللهجات العربية.
@@ -47,7 +48,7 @@ TEACHER_SYSTEM_PROMPT = """
 4. إذا لم تتوفر الإجابة، قل:
    "المعلومة غير موجودة في المستندات المتاحة."
 5. لا تخترع حقائق أو أرقاماً أو مراجع.
-6. استخدم رقم مصدر واحدًا بعد الادعاء عند الحاجة، ولا تكرر رقم المصدر أو تضع قائمة أرقام في نهاية الإجابة.
+6. استشهد بكل ادعاء منهجي بمعرّف المقطع الحرفي بصيغة [chunk:معرّف_المقطع]، ولا تخترع معرّفات.
 7. لا تكتب أسماء الملفات أو أرقام الصفحات؛ التطبيق يعرضها بشكل منفصل.
 8. لا تكرر المعلومات أو الاستشهادات دون داعٍ.
 9. استخدم لغة مهنية واضحة.
@@ -73,11 +74,14 @@ def build_context_prompt(
 ) -> str:
 
     source_blocks = []
+    remaining = settings.RETRIEVAL_MAX_CONTEXT_CHARS
 
     for i, result in enumerate(results, start=1):
-        source_blocks.append(
-            f"[{i}]\n{result.content}"
-        )
+        if remaining <= 0:
+            break
+        block = f"[chunk:{result.chunk_id}]\n{result.content[:remaining]}"
+        source_blocks.append(block)
+        remaining -= len(block)
 
     sources_block = "\n\n".join(source_blocks)
 
@@ -90,7 +94,7 @@ def build_context_prompt(
 {question}
 
 اكتب إجابة طبيعية على المقصود من السؤال اعتماداً على المصادر المرجعية فقط، واستفد من سياق المحادثة السابق عند تفسير الإشارات مثل «ده» و«كمل».
-ضع رقم المصدر بين الأقواس المربعة بعد الادعاء المدعوم فقط. لا تكرر رقم المصدر ولا تكتب قائمة أرقام في النهاية؛ التطبيق يعرض المصادر منفصلة.
+استشهد بكل ادعاء منهجي باستخدام معرّف المقطع كما ورد حرفيًا بهذا الشكل [chunk:معرّف_المقطع]. لا تخترع أو تغيّر المعرّفات، وضع الاستشهاد بعد الادعاء المدعوم. إذا لم يدعم أي مقطع الإجابة، صرّح بذلك بدل التخمين.
 """
 
 
@@ -106,11 +110,12 @@ def build_messages(
             "content": get_system_prompt(section),
         },
     ]
-    for message in (chat_history or [])[-10:]:
+    recent_history = (chat_history or [])[-settings.CHAT_HISTORY_LIMIT:] if settings.CHAT_HISTORY_LIMIT else []
+    for message in recent_history:
         role = message.get("role")
         content = message.get("content", "")
         if role in {"user", "assistant"} and content.strip():
-            messages.append({"role": role, "content": content[:6000]})
+            messages.append({"role": role, "content": content[:settings.CHAT_HISTORY_MESSAGE_CHARS]})
     messages.append({
             "role": "user",
             "content": build_context_prompt(

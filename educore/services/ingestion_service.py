@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from educore.config import settings
 from educore.database.models import Document, DocumentStatus
-from educore.database.repositories import DocumentRepository
+from educore.database.repositories import DocumentRepository, ProjectRepository
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +30,24 @@ class IngestionService:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.doc_repo = DocumentRepository(session)
+        self.project_repo = ProjectRepository(session)
 
     async def upload_document(
         self,
         project_id: uuid.UUID,
+        user_id: uuid.UUID,
         filename: str,
         file_content: bytes,
     ) -> Document:
         """Save an uploaded file and create its database record."""
+
+        project = await self.project_repo.get_by_id(project_id)
+
+        if not project:
+            raise ValueError("Project not found")
+
+        if project.owner_id != user_id:
+            raise ValueError("Not authorized to access this project")
 
         ext = Path(filename).suffix.lower().strip(".")
 
@@ -135,6 +145,7 @@ class IngestionService:
     async def delete_document(
         self,
         document_id: uuid.UUID,
+        user_id: uuid.UUID,
     ) -> dict:
         """Delete one document and its associated chunks."""
 
@@ -142,6 +153,11 @@ class IngestionService:
 
         if not doc:
             raise ValueError("Document not found")
+
+        project = await self.project_repo.get_by_id(doc.project_id)
+
+        if not project or project.owner_id != user_id:
+            raise ValueError("Not authorized to delete this document")
 
         # Only block deletion while Celery is actively processing it.
         # Pending and failed documents can be deleted.

@@ -13,6 +13,10 @@ def get_student_version(
         question.pop("correct_answer", None)
         question.pop("explanation", None)
         question.pop("marking_scheme", None)
+        question.pop("model_answer", None)
+        question.pop("grading_rubric", None)
+        question.pop("expected_answer", None)
+        question.pop("acceptable_alternatives", None)
 
     return result
 
@@ -91,14 +95,16 @@ def format_assessment_text(
             lines.append(f"   {option.id}) {option.text}")
 
         if include_answers:
-            lines.append(
-                f"Answer: {question.correct_answer or 'Not provided'}"
-            )
+            answer = question.model_answer or question.expected_answer
+            if answer is None:
+                answer = question.correct_answer
+            lines.append(f"Answer: {answer if answer is not None else 'Not provided'}")
 
             if question.explanation:
                 lines.append(f"Explanation: {question.explanation}")
 
-            for point in question.marking_scheme:
+            rubric = question.grading_rubric or question.marking_scheme
+            for point in rubric:
                 lines.append(
                     f"- {point.description}: {point.marks} marks"
                 )

@@ -1,7 +1,8 @@
 
-import json
+from pydantic import ValidationError
 
-from educore.teacher_ai.core.llm_client import llm_client
+from educore.structured_output import StructuredOutputError, parse_json_object
+from educore.teacher_ai.core.llm_client import LLMTruncatedError, llm_client
 
 from .schemas import CommunicationRequest, CommunicationResult
 
@@ -53,25 +54,33 @@ Write an appropriate message for this situation.
 Return JSON only.
 """
 
-    response = llm_client.generate(
-        system_prompt=SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        temperature=0.3,
-        max_tokens=2000,
-    )
+    for attempt in range(2):
+        try:
+            response = llm_client.generate(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                temperature=0.3,
+                max_tokens=2000,
+            )
+            data = parse_json_object(response)
+            # Recipient details come from the validated request, not model output.
+            return CommunicationResult.model_validate({
+                **data,
+                "recipient_type": request.recipient_type,
+                "recipient_name": request.recipient_name,
+                "tone": data.get("tone") or request.tone,
+                "language": data.get("language") or "English",
+            })
+        except LLMTruncatedError as exc:
+            if attempt:
+                raise ValueError("The communication response was incomplete after one retry.") from exc
+            user_prompt += "\n\nRETRY: Return a complete JSON object with concise, non-empty subject_line and message fields."
+        except (StructuredOutputError, TypeError, ValueError, ValidationError) as exc:
+            if attempt:
+                raise ValueError(
+                    "The AI returned an invalid communication message; expected non-empty "
+                    "subject_line and message fields."
+                ) from exc
+            user_prompt += "\n\nCORRECTION: Return one valid JSON object with non-empty subject_line and message fields."
 
-    try:
-        data = json.loads(response)
-    except (json.JSONDecodeError, TypeError):
-        raise ValueError(
-            "The AI returned invalid JSON for the communication message."
-        )
-
-    return CommunicationResult(
-        recipient_type=request.recipient_type,
-        recipient_name=request.recipient_name,
-        subject_line=data["subject_line"],
-        message=data["message"],
-        tone=data.get("tone", request.tone),
-        language=data.get("language", "English"),
-    )
+    raise ValueError("The AI could not create a valid communication message.")

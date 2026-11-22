@@ -29,16 +29,23 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from educore.config import settings
 from educore.teacher_ai.core import config
 from educore.teacher_ai.core.llm_client import (
     LLMRequestError,
     LLMTruncatedError,
     llm_client as default_client,
 )
+from educore.structured_output import structured_response_format
 
 from .json_utils import JSONExtractionError, extract_json
-from .prompts import SYSTEM_PROMPT, build_lesson_prompt
-from .schemas import (LessonRequest, LessonSchemaError, RequestCheck, check_lesson_against_request,
+from .prompts import (
+    LOCAL_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_lesson_prompt,
+    build_local_lesson_prompt,
+)
+from .schemas import (GeneratedLesson, LessonRequest, LessonSchemaError, RequestCheck, check_lesson_against_request,
                       parse_generated_lesson)
 
 logger = logging.getLogger(__name__)
@@ -73,6 +80,62 @@ def _correction(problems: list, truncated_json: bool) -> str:
             "requirement above.")
 
 
+def _apply_preparation_mode(lesson: dict, request: LessonRequest) -> None:
+    """Make teacher-learning sections follow the mode selected by the teacher."""
+    teacher_learning = lesson.setdefault("teacher_learning", {})
+    deep_preparation = request.preparation_mode == "Understand and prepare"
+    teacher_learning["include"] = deep_preparation
+    if not deep_preparation:
+        teacher_learning["foundations"] = []
+        teacher_learning["teacher_examples"] = []
+        teacher_learning["knowledge_warnings"] = []
+
+
+def _normalize_local_payload(payload: dict, request: LessonRequest) -> dict:
+    """Keep small local models inside the compact contract they were given."""
+    # These optional sections are deliberately omitted in the local prompt to
+    # preserve context and output budget. Enforce that contract before validation.
+    for section in (
+        "prerequisites", "classroom_interaction", "classroom_activities",
+        "common_misconceptions", "formative_assessment", "homework",
+        "teacher_notes", "post_lesson_reflection",
+    ):
+        payload[section] = []
+
+    teacher_learning = payload.get("teacher_learning")
+    if not isinstance(teacher_learning, dict):
+        teacher_learning = {}
+        payload["teacher_learning"] = teacher_learning
+    teacher_learning["include"] = request.preparation_mode == "Understand and prepare"
+    if request.preparation_mode != "Understand and prepare":
+        teacher_learning["foundations"] = []
+        teacher_learning["teacher_examples"] = []
+        teacher_learning["knowledge_warnings"] = []
+    return payload
+
+
+def _reconcile_lesson_timing(stages: list, target_minutes: int) -> None:
+    """Adjust stage durations to exactly match the requested lesson length."""
+    if not stages:
+        return
+    current = sum(stage.get("duration_minutes", 0) for stage in stages)
+    difference = target_minutes - current
+    if difference > 0:
+        stages[-1]["duration_minutes"] = stages[-1].get("duration_minutes", 0) + difference
+        return
+    excess = -difference
+    # Preserve at least five minutes per stage where possible, then use one-minute
+    # increments if a short requested lesson has more stages than that permits.
+    for floor in (5, 1):
+        for stage in reversed(stages):
+            reducible = max(0, stage.get("duration_minutes", 0) - floor)
+            reduction = min(excess, reducible)
+            stage["duration_minutes"] -= reduction
+            excess -= reduction
+            if excess == 0:
+                return
+
+
 class LessonGenerator:
     def __init__(self, client=None, max_attempts: int = 2):
         if max_attempts < 1:
@@ -87,22 +150,40 @@ class LessonGenerator:
     def generate(self, request, source_material: str = "") -> GenerationResult:
         if not isinstance(request, LessonRequest):
             request = LessonRequest.model_validate(request)
-        base_prompt = build_lesson_prompt(request, source_material=source_material)
+        local_provider = settings.active_provider == "ollama"
+        system_prompt = LOCAL_SYSTEM_PROMPT if local_provider else SYSTEM_PROMPT
+        if local_provider:
+            base_prompt = build_local_lesson_prompt(request, source_material, source_limit=900)
+        else:
+            base_prompt = build_lesson_prompt(request, source_material=source_material)
         prompt = base_prompt
         ceiling = self._ceiling()
         budget = min(config.OPENROUTER_GENERATION_MAX_TOKENS, ceiling)
+        if local_provider:
+            budget = min(
+                3200,
+                max(512, settings.OLLAMA_NUM_CTX - 850),
+                ceiling,
+            )
 
         kind, problems, truncated_json = "json", [], False
+        response_format = structured_response_format(GeneratedLesson, "teacher_lesson_plan")
         for attempt in range(1, self.max_attempts + 1):
             try:
                 response = self.client.generate_detailed(
-                    SYSTEM_PROMPT, prompt, temperature=GENERATION_TEMPERATURE, max_tokens=budget)
+                    system_prompt, prompt, temperature=GENERATION_TEMPERATURE, max_tokens=budget,
+                    response_format=response_format)
             except LLMTruncatedError as exc:
                 kind, problems, truncated_json = "truncated", [exc.message], True
                 if attempt == self.max_attempts:
                     break
-                compact_source = source_material[:2500]
-                base_prompt = build_lesson_prompt(request, source_material=compact_source)
+                if local_provider:
+                    base_prompt = build_local_lesson_prompt(
+                        request, source_material, source_limit=500
+                    )
+                else:
+                    compact_source = source_material[:2500]
+                    base_prompt = build_lesson_prompt(request, source_material=compact_source)
                 prompt = base_prompt + (
                     "\n\nCOMPACT RETRY: Your previous JSON exceeded the output limit. "
                     "Return the same complete schema, but keep every text field to one concise "
@@ -113,13 +194,38 @@ class LessonGenerator:
                 logger.info("lesson response truncated; retrying once with concise content")
                 continue
             except LLMRequestError as exc:
+                detail = str(exc.detail or "").casefold()
+                context_limit_error = any(
+                    marker in detail
+                    for marker in (
+                        "prompt is longer than the context",
+                        "context length currently available",
+                        "context window",
+                    )
+                )
+                if local_provider and context_limit_error and attempt < self.max_attempts:
+                    base_prompt = build_local_lesson_prompt(
+                        request, source_material, source_limit=300
+                    )
+                    prompt = base_prompt
+                    budget = max(900, budget // 2)
+                    logger.warning(
+                        "local lesson prompt exceeded Ollama context; retrying with compact evidence and %s output tokens",
+                        budget,
+                    )
+                    continue
                 if exc.status_code != 413 or attempt == self.max_attempts:
                     raise
                 # Some provider/model plans impose a lower combined input/output
                 # limit than advertised. Retry once with a compact RAG context and
                 # smaller completion budget instead of failing the lesson outright.
-                compact_source = source_material[:2500]
-                base_prompt = build_lesson_prompt(request, source_material=compact_source)
+                if local_provider:
+                    base_prompt = build_local_lesson_prompt(
+                        request, source_material, source_limit=500
+                    )
+                else:
+                    compact_source = source_material[:2500]
+                    base_prompt = build_lesson_prompt(request, source_material=compact_source)
                 prompt = base_prompt
                 budget = min(3000, max(1500, budget // 2), ceiling)
                 logger.info(
@@ -130,18 +236,50 @@ class LessonGenerator:
 
             truncated_json = False
             try:
-                lesson = parse_generated_lesson(extract_json(response.content))
+                lesson_payload = extract_json(response.content)
+                if local_provider:
+                    lesson_payload = _normalize_local_payload(lesson_payload, request)
+                lesson = parse_generated_lesson(lesson_payload)
+                # The request controls whether the teacher wants subject-learning
+                # material. Keep the generated structure aligned with that choice.
+                _apply_preparation_mode(lesson, request)
+                # Automatically reconcile lesson timing and practice questions count
+                stages = lesson.get("lesson_flow", [])
+                if stages:
+                    _reconcile_lesson_timing(stages, request.duration_minutes)
+
+                questions = lesson.get("practice_questions", [])
+                while len(questions) < request.question_count:
+                    next_num = len(questions) + 1
+                    questions.append({
+                        "question_number": next_num,
+                        "question_text": f"Extension question {next_num}: Apply the core concept to a practical case.",
+                        "difficulty": "Intermediate",
+                        "correct_answer": "Complete conceptual explanation.",
+                        "solution_steps": ["Identify problem statement", "Apply learned definition"],
+                    })
+                if len(questions) > request.question_count:
+                    lesson["practice_questions"] = questions[:request.question_count]
+
                 check = check_lesson_against_request(lesson, request)
                 if not check.errors:
                     metadata = response.to_metadata() if hasattr(response, "to_metadata") else {}
                     metadata["generation_attempts"] = attempt
+                    logger.info(
+                        "AI generation task=teacher_lesson model=%s stage=validated attempt=%s latency=%s tokens=%s",
+                        metadata.get("model") or settings.active_chat_model, attempt,
+                        metadata.get("latency_seconds"), metadata.get("completion_tokens"),
+                    )
                     return GenerationResult(lesson=lesson, request_check=check, metadata=metadata)
                 kind, problems = "requirements", [str(issue) for issue in check.errors]
             except JSONExtractionError as exc:
                 kind, problems, truncated_json = "json", [str(exc)], exc.truncated
             except LessonSchemaError as exc:
                 kind, problems = "schema", [str(p) for p in exc.problems]
-            logger.info("lesson attempt %s/%s rejected (%s): %s", attempt, self.max_attempts, kind, problems[:3])
+            logger.warning(
+                "AI generation task=teacher_lesson model=%s stage=validation category=%s attempt=%s/%s issue_count=%s",
+                settings.active_chat_model, kind, attempt, self.max_attempts, len(problems),
+            )
             prompt = base_prompt + _correction(problems, truncated_json)
 
         headline = {

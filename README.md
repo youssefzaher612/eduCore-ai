@@ -2,7 +2,7 @@
 
 A complete, production-ready **RAG (Retrieval-Augmented Generation)** system for education, with separate **Student** and **Teacher** sections.
 
-Built with **FastAPI**, **PostgreSQL + pgvector**, **OpenRouter** (free model endpoints), **Celery + RabbitMQ**, and **Streamlit**.
+Built with **FastAPI**, **PostgreSQL + pgvector**, **Groq** for text generation, **Celery + RabbitMQ**, and **Streamlit**.
 
 ---
 
@@ -23,7 +23,7 @@ Built with **FastAPI**, **PostgreSQL + pgvector**, **OpenRouter** (free model en
 ## 🏗️ Architecture
 
 ```
-Streamlit UI ──→ FastAPI API ──→ RAG Engine ──→ OpenRouter (LLM)
+Streamlit UI ──→ FastAPI API ──→ RAG Engine ──→ Groq (LLM)
                       │                │
                       │                ├──→ sentence-transformers (Embeddings)
                       │                └──→ pgvector (Vector Search)
@@ -58,7 +58,7 @@ uv sync --extra streamlit
 
 ```bash
 cp .env.example .env
-# Edit .env — set OPENROUTER_API_KEY (create one at https://openrouter.ai/settings/keys)
+# Edit .env — set GROQ_API_KEY (create one at https://console.groq.com/keys)
 ```
 
 ### 3.1 Enable OCR for scanned PDFs (Windows)
@@ -175,10 +175,16 @@ All settings are in `.env` — see `.env.example` for the full list:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `OPENROUTER_API_KEY` | — | Your OpenRouter API key (required) |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API endpoint |
-| `OPENROUTER_CHAT_MODEL` | `baidu/ernie-5.5-flash-preview:free` | Student and teacher text generation |
-| `OPENROUTER_VISION_MODEL` | `nvidia/nemotron-3.5-super-vl:free` | Temporary image and document understanding |
+| `LLM_PROVIDER` | `groq` | Text generation uses Groq |
+| `GROQ_API_KEY` | — | Groq API key when `LLM_PROVIDER=groq` |
+| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groq OpenAI-compatible endpoint |
+| `GROQ_CHAT_MODEL` | `openai/gpt-oss-120b` | Student and teacher text generation on Groq |
+| `GROQ_FAST_MODEL` | `openai/gpt-oss-20b` | Fallback generation model on Groq |
+| `GROQ_WEB_SEARCH_ENABLED` | `false` | Enable Groq built-in browser search only when requested |
+| `OPENROUTER_API_KEY` | — | Legacy setting; not used for text or image generation |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Legacy setting; text generation uses `GROQ_BASE_URL` |
+| `GOOGLE_API_KEY` | — | Google AI Studio key for image understanding |
+| `GOOGLE_VISION_MODEL` | `gemini-2.5-flash` | Gemini image understanding model |
 | `OPENROUTER_ENABLE_WEB_SEARCH` | `false` | Enable separately billed external web search only when desired |
 | `EMBEDDING_MODEL_NAME` | `all-MiniLM-L6-v2` | sentence-transformers model |
 | `EMBEDDING_DIMENSIONS` | `384` | Must match the embedding model |
@@ -217,14 +223,14 @@ Question → LLM rewrite for lecture search → Embed → Cosine Search → Top-
 Prompt Assembly (system prompt + context + history + question)
     │
     ▼
-Streaming Generation (OpenRouter API → SSE)
+Streaming Generation (Groq API → SSE)
 ```
 
 ---
 
 ## 🎓 Student AI integration
 
-The student interface now includes progress, adaptive practice, and exam tabs alongside the existing RAG chat and course library. Student and teacher AI features share EduCore's OpenRouter configuration and PostgreSQL database.
+The student interface now includes progress, adaptive practice, and exam tabs alongside the existing RAG chat and course library. Student and teacher text-generation features share EduCore's Groq configuration and PostgreSQL database.
 
 - Practice answers are graded on the server and saved by student and course.
 - Topic progress combines observed accuracy with Bayesian Knowledge Tracing mastery estimates.
@@ -236,8 +242,8 @@ The student interface now includes progress, adaptive practice, and exam tabs al
 - Student questions about their own progress, weak topics, or study plan are answered from recorded attempts in the existing chat. Course-content questions continue through the RAG evidence flow.
 - The student chat has two response modes: **Study** explains and teaches; **Hint** gives a nudge without revealing the final answer or correct option.
 - Questions in Arabic, English, or dialect are rewritten into concise bilingual search terms before lecture retrieval. Answers stay in the user's language and style.
-- Uploaded lectures are the default source. When retrieval cannot support an answer, the chat asks before searching outside the course; an explicit web request searches immediately. External answers combine browser search with model synthesis and show source links when available.
-- External web search is disabled by default because OpenRouter search tools have separate pricing from free model inference.
+- Uploaded lectures are the default source. Web search is disabled by default; when explicitly enabled, unsupported answers ask for consent before searching, while an explicit web request counts as consent. External answers combine browser search with model synthesis and show source links when available.
+- External web search uses the configured provider's browser tool; availability and charges depend on the selected provider and model.
 
 Apply the database migrations before using these features:
 

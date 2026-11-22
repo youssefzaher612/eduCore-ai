@@ -66,7 +66,11 @@ def process_document_task(self, document_id: str) -> dict:
         doc_repo.update_status(doc_uuid, DocumentStatus.PROCESSING)
 
         # ── 2. Extract text ─────────────────────────────────────────
-        pages = DocumentExtractor.extract(doc.file_path, doc.file_type)
+        pages = DocumentExtractor.extract(
+            doc.file_path,
+            doc.file_type,
+            cache_scope=f"{doc.project_id}:{doc_uuid}",
+        )
 
         if not pages:
             doc_repo.update_status(

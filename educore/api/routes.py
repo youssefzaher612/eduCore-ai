@@ -27,6 +27,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import StreamingResponse
+import httpx
 from openai import APIError, RateLimitError
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,8 +41,10 @@ from educore.api.deps import (
 )
 from educore.database.models import UserRole
 from educore.database.repositories import ProjectRepository, UserRepository
+from educore.config import settings
 from educore.services.chat_service import ChatService
 from educore.services.ingestion_service import IngestionService
+from educore.services.student_service import ImageAnalysisProviderError
 from educore.tasks.ingestion_tasks import process_document_task
 
 logger = logging.getLogger(__name__)
@@ -96,17 +99,68 @@ class StudentExamRequest(StudentScopeRequest):
     difficulty: str = "Mixed"
     question_count: int = Field(default=5, ge=1, le=20)
     language: Literal["Arabic", "English"] = "English"
+    question_type: Literal["mcq", "true_false", "essay", "short_answer", "mixed"] = "mcq"
 
 
 class StudentExamSubmitRequest(StudentScopeRequest):
-    answers: list[int | None]
+    answers: list[object | None]
 
 
 # Health
 
 @router.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "EduCore RAG"}
+    return {
+        "status": "ok",
+        "service": "EduCore RAG",
+        "ai_provider": settings.active_provider,
+        "ai_model": settings.active_chat_model,
+    }
+
+
+@router.get("/ai/status")
+async def ai_status():
+    """Report local model availability without exposing provider credentials."""
+    if settings.active_provider != "ollama":
+        configured = bool(
+            settings.GROQ_API_KEY if settings.active_provider == "groq"
+            else settings.OPENROUTER_API_KEY
+        )
+        return {
+            "provider": settings.active_provider,
+            "available": configured,
+            "model": settings.active_chat_model,
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
+            response.raise_for_status()
+            models = [
+                item.get("name", "")
+                for item in response.json().get("models", [])
+                if item.get("name")
+            ]
+        return {
+            "provider": "ollama",
+            "available": True,
+            "model": settings.OLLAMA_CHAT_MODEL,
+            "vision_model": settings.OLLAMA_VISION_MODEL,
+            "chat_model_installed": any(
+                name == settings.OLLAMA_CHAT_MODEL
+                or name.split(":", 1)[0] == settings.OLLAMA_CHAT_MODEL.split(":", 1)[0]
+                for name in models
+            ),
+            "installed_models": models,
+        }
+    except (httpx.HTTPError, ValueError):
+        return {
+            "provider": "ollama",
+            "available": False,
+            "model": settings.OLLAMA_CHAT_MODEL,
+            "vision_model": settings.OLLAMA_VISION_MODEL,
+            "installed_models": [],
+        }
 
 
 # Users
@@ -255,6 +309,7 @@ async def delete_project(
 @router.post("/documents/upload", status_code=201)
 async def upload_document(
     project_id: str = Query(..., description="UUID of the project"),
+    user_id: str = Query(..., description="UUID of the user"),
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_session),
 ):
@@ -264,6 +319,10 @@ async def upload_document(
         parsed_project_id = uuid.UUID(project_id)
     except ValueError:
         raise HTTPException(400, "Invalid project ID")
+    try:
+        parsed_user_id = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid user ID")
 
     service = get_ingestion_service(session)
 
@@ -272,6 +331,7 @@ async def upload_document(
 
         doc = await service.upload_document(
             project_id=parsed_project_id,
+            user_id=parsed_user_id,
             filename=file.filename or "unnamed",
             file_content=content,
         )
@@ -333,6 +393,7 @@ async def document_status(
 @router.delete("/documents/{document_id}")
 async def delete_document(
     document_id: str,
+    user_id: str = Query(..., description="UUID of the user"),
     session: AsyncSession = Depends(get_session),
 ):
     """Delete one document and its associated chunks."""
@@ -341,11 +402,15 @@ async def delete_document(
         parsed_id = uuid.UUID(document_id)
     except ValueError:
         raise HTTPException(400, "Invalid document ID")
+    try:
+        parsed_user_id = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid user ID")
 
     service = get_ingestion_service(session)
 
     try:
-        result = await service.delete_document(parsed_id)
+        result = await service.delete_document(parsed_id, parsed_user_id)
 
         # Commit DB deletion first.
         await session.commit()
@@ -426,7 +491,7 @@ async def teacher_course_materials(
             detail=(
                 "وصل نموذج الذكاء الاصطناعي إلى حد الطلبات الحالي. "
                 "انتظر دقيقة ثم أعد المحاولة، أو اختر نموذجًا بحدود أعلى "
-                "في OPENROUTER_CHAT_MODEL داخل ملف .env."
+                "في GROQ_CHAT_MODEL داخل ملف .env."
             ),
             headers={"Retry-After": "60"},
         ) from exc
@@ -504,6 +569,7 @@ async def generate_student_exam(
             difficulty=req.difficulty,
             question_count=req.question_count,
             language=req.language,
+            question_type=req.question_type,
         )
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
@@ -515,12 +581,13 @@ async def generate_student_exam(
             detail=(
                 "وصل نموذج الذكاء الاصطناعي إلى حد الطلبات الحالي. "
                 "انتظر دقيقة ثم أعد المحاولة، أو اختر نموذجًا بحدود أعلى "
-                "في OPENROUTER_CHAT_MODEL داخل ملف .env."
+                "في GROQ_CHAT_MODEL داخل ملف .env."
             ),
             headers={"Retry-After": "60"},
         ) from exc
     except APIError as exc:
-        logger.exception("OpenRouter failed while generating a student exam")
+        logger.warning("AI generation task=student_practice_exam stage=provider_error error_category=%s",
+                       type(exc).__name__)
         raise HTTPException(502, "تعذر الاتصال بخدمة إنشاء الامتحان. جرّب مرة أخرى.") from exc
 
 
@@ -535,7 +602,7 @@ async def analyze_student_image(
     try:
         service = get_student_service(session)
         await service.validate_scope(user_id, project_id)
-        image_bytes = await file.read(12 * 1024 * 1024 + 1)
+        image_bytes = await file.read(settings.VISION_MAX_UPLOAD_BYTES + 1)
         return await service.analyze_image(
             user_id=user_id,
             project_id=project_id,
@@ -545,6 +612,8 @@ async def analyze_student_image(
         )
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
+    except ImageAnalysisProviderError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -704,7 +773,7 @@ async def ask_about_image(
         raise HTTPException(400, "Invalid session ID") from exc
 
     try:
-        image_bytes = await file.read(12 * 1024 * 1024 + 1)
+        image_bytes = await file.read(settings.VISION_MAX_UPLOAD_BYTES + 1)
         service = get_chat_service(session)
         return await service.ask_image(
             session_id=parsed_id,
@@ -715,6 +784,8 @@ async def ask_about_image(
         )
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
+    except ImageAnalysisProviderError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except RateLimitError as exc:

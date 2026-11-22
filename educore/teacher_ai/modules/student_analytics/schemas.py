@@ -1,7 +1,9 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from datetime import date, datetime
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TopicPerformance(BaseModel):
@@ -29,6 +31,21 @@ class StudentAssessmentRecord(BaseModel):
     topic_performance: list[TopicPerformance] = Field(
         default_factory=list
     )
+
+    @field_validator("assessment_date")
+    @classmethod
+    def validate_assessment_date(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip()
+        try:
+            date.fromisoformat(normalized)
+        except ValueError:
+            try:
+                datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("assessment_date must be an ISO date or datetime") from exc
+        return normalized
 
 
 class AnalyticsRequest(BaseModel):

@@ -1,5 +1,6 @@
 
 from collections import defaultdict
+from datetime import date, datetime, timezone
 
 from .schemas import (
     AnalyticsRequest,
@@ -13,6 +14,21 @@ def _percentage(awarded: float, maximum: float) -> float:
     return round((awarded / maximum) * 100, 2)
 
 
+def _record_order(record, input_index: int) -> tuple:
+    """Use assessment dates when present; retain input order as a fallback."""
+    value = record.assessment_date
+    if not value:
+        return (0, input_index)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        parsed_date = date.fromisoformat(value)
+        parsed = datetime.combine(parsed_date, datetime.min.time(), tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (1, parsed.timestamp())
+
+
 def analyze_student_performance(
     request: AnalyticsRequest,
 ) -> AnalyticsResult:
@@ -22,7 +38,7 @@ def analyze_student_performance(
     student_records = defaultdict(list)
     topic_records = defaultdict(list)
 
-    for record in request.records:
+    for input_index, record in enumerate(request.records):
         if record.awarded_marks > record.max_marks:
             raise ValueError(
                 f"Student {record.student_id}: awarded marks "
@@ -38,6 +54,8 @@ def analyze_student_performance(
             {
                 "name": record.student_name,
                 "percentage": percentage,
+                "record": record,
+                "input_index": input_index,
             }
         )
 
@@ -49,16 +67,18 @@ def analyze_student_performance(
                 )
 
             topic_records[topic.topic].append(
-                _percentage(topic.awarded_marks, topic.max_marks)
+                (record.student_id, topic.awarded_marks, topic.max_marks)
             )
 
     student_insights = []
 
     for student_id, records in student_records.items():
-        percentages = [item["percentage"] for item in records]
+        latest_record = max(records, key=lambda item: _record_order(item["record"], item["input_index"]))
 
-        average = round(sum(percentages) / len(percentages), 2)
-        latest = percentages[-1]
+        awarded_total = sum(item["record"].awarded_marks for item in records)
+        maximum_total = sum(item["record"].max_marks for item in records)
+        average = _percentage(awarded_total, maximum_total)
+        latest = latest_record["percentage"]
 
         if average >= 85:
             status = "Excellent"
@@ -70,7 +90,7 @@ def analyze_student_performance(
         student_insights.append(
             StudentInsight(
                 student_id=student_id,
-                student_name=records[-1]["name"],
+                student_name=latest_record["name"],
                 assessment_count=len(records),
                 average_percentage=average,
                 latest_percentage=latest,
@@ -80,8 +100,10 @@ def analyze_student_performance(
 
     topic_insights = []
 
-    for topic_name, percentages in topic_records.items():
-        average = round(sum(percentages) / len(percentages), 2)
+    for topic_name, marks in topic_records.items():
+        awarded_total = sum(awarded for _, awarded, _ in marks)
+        maximum_total = sum(maximum for _, _, maximum in marks)
+        average = _percentage(awarded_total, maximum_total)
 
         if average >= 85:
             level = "Strong"
@@ -94,7 +116,7 @@ def analyze_student_performance(
             TopicInsight(
                 topic=topic_name,
                 average_percentage=average,
-                students_count=len(percentages),
+                students_count=len({student_id for student_id, _, _ in marks}),
                 performance_level=level,
             )
         )
@@ -103,13 +125,6 @@ def analyze_student_performance(
         student.average_percentage
         for student in student_insights
     ]
-
-    total_awarded = sum(
-        record.awarded_marks for record in request.records
-    )
-    total_maximum = sum(
-        record.max_marks for record in request.records
-    )
 
     class_average = round(
         sum(student_averages) / len(student_averages),

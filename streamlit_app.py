@@ -21,7 +21,7 @@ from educore.rag.query_processor import process_query
 
 # Configuration
 
-API_BASE = os.getenv("EDUCORE_API_BASE", "http://127.0.0.1:8001/api")
+API_BASE = os.getenv("EDUCORE_API_BASE", "http://127.0.0.1:8002/api")
 TIMEOUT = httpx.Timeout(30.0, read=120.0)
 
 DEFAULT_USER_EMAIL = "educore@example.com"
@@ -289,7 +289,9 @@ def normalize_chat_answer(
 
 # Automatic default setup
 
-if not st.session_state.user_id or not st.session_state.project_id:
+def ensure_default_user_and_project() -> bool:
+    if st.session_state.user_id and st.session_state.project_id:
+        return True
 
     user = api_post(
         "/users",
@@ -300,7 +302,7 @@ if not st.session_state.user_id or not st.session_state.project_id:
         },
     )
 
-    if user:
+    if user and "id" in user:
         st.session_state.user_id = user["id"]
 
         projects = api_get(
@@ -310,7 +312,7 @@ if not st.session_state.user_id or not st.session_state.project_id:
 
         if projects and len(projects) > 0:
             st.session_state.project_id = projects[0]["id"]
-
+            return True
         else:
             new_project = api_post(
                 "/projects",
@@ -321,8 +323,12 @@ if not st.session_state.user_id or not st.session_state.project_id:
                 params={"owner_id": user["id"]},
             )
 
-            if new_project:
+            if new_project and "id" in new_project:
                 st.session_state.project_id = new_project["id"]
+                return True
+    return False
+
+ensure_default_user_and_project()
 
 
 # Sidebar
@@ -632,7 +638,14 @@ with tab_chat:
             if not image_file:
                 st.warning("ارفع صورة الأول.")
             else:
+                if not st.session_state.project_id or not st.session_state.user_id:
+                    ensure_default_user_and_project()
+
                 if not st.session_state.chat_session_id:
+                    if not st.session_state.project_id or not st.session_state.user_id:
+                        st.error("تعذر الاتصال بالسيرفر أو تحميل بيانات المقرر.")
+                        st.stop()
+
                     chat = api_post(
                         "/chat/sessions",
                         {
@@ -685,7 +698,14 @@ with tab_chat:
     if question := st.chat_input(
         "اسأل عن المحاضرات أو مستواك، أو قل: اعملي خطة مذاكرة..."
     ):
+        if not st.session_state.project_id or not st.session_state.user_id:
+            ensure_default_user_and_project()
+
         if not st.session_state.chat_session_id:
+            if not st.session_state.project_id or not st.session_state.user_id:
+                st.error("تعذر الاتصال بالسيرفر أو تحميل بيانات المقرر. يرجى إعادة المحاولة بعد ثوانٍ.")
+                st.stop()
+
             chat = api_post(
                 "/chat/sessions",
                 {
@@ -1099,6 +1119,9 @@ with tab_practice:
             format_func=lambda value: "متنوع" if value == "Mixed" else value,
             key="exam_difficulty",
         )
+        exam_question_type = st.selectbox("Question type", ["mcq", "true_false", "short_answer", "essay", "mixed"],
+                                          format_func=lambda value: {"mcq": "Multiple choice", "true_false": "True / False", "short_answer": "Short answer", "essay": "Essay", "mixed": "Mixed"}[value],
+                                          key="exam_question_type")
         question_count = st.slider(
             "عدد الأسئلة", min_value=1, max_value=20, value=5, key="exam_question_count"
         )
@@ -1108,6 +1131,7 @@ with tab_practice:
             exam_language,
             exam_difficulty,
             question_count,
+            exam_question_type,
         )
         if st.session_state.get("student_exam_config") != exam_config:
             st.session_state.student_exam = None
@@ -1134,6 +1158,7 @@ with tab_practice:
                     "difficulty": exam_difficulty,
                     "question_count": question_count,
                     "language": exam_language,
+                    "question_type": exam_question_type,
             }
             exam = api_post("/student/exams", exam_request)
             if exam:
@@ -1194,13 +1219,17 @@ with tab_practice:
                                 )
                             st.session_state.student_exam = exam
 
-                    st.radio(
-                        "اختار إجابتك",
-                        options=[None, *range(len(question["options"]))],
-                        format_func=lambda choice, options=question["options"]: "اختار إجابة" if choice is None else options[choice],
-                        index=0,
-                        key=f"exam_answer_{exam['exam_id']}_{index}",
-                    )
+                    answer_key = f"exam_answer_{exam['exam_id']}_{index}"
+                    kind = question.get("question_type", "mcq")
+                    if kind == "mcq":
+                        st.radio("Choose your answer", options=[None, *range(len(question["options"]))],
+                                 format_func=lambda choice, options=question["options"]: "Choose" if choice is None else options[choice], index=0, key=answer_key)
+                    elif kind == "true_false":
+                        st.radio("Your answer", options=[None, True, False], format_func=lambda value: "Choose" if value is None else ("True" if value else "False"), index=0, key=answer_key)
+                    elif kind == "essay":
+                        st.text_area("Your answer", key=answer_key, height=140)
+                    else:
+                        st.text_input("Your answer", key=answer_key)
                     for hint_number, hint_text in enumerate(
                         question.get("hints") or [], start=1
                     ):
@@ -1237,13 +1266,13 @@ with tab_practice:
 
         exam_result = st.session_state.student_exam_result
         if exam_result:
-            st.success(
-                f"نتيجتك: {exam_result['score_pct']}% "
-                f"({exam_result['correct']} من {exam_result['total']})"
-            )
+            if exam_result.get("score_pct") is None:
+                st.info(f"Exam submitted. {exam_result.get('ungraded_count', 0)} essay response(s) need review.")
+            else:
+                st.success(f"Result: {exam_result['score_pct']}% ({exam_result['correct']} correct of {exam_result.get('graded_count', exam_result['total'])} graded)")
             with st.expander("مراجعة الإجابات", expanded=True):
                 for index, item in enumerate(exam_result["review"], start=1):
-                    status = "✅" if item["is_correct"] else "❌"
+                    status = "??" if item["is_correct"] is None else "?" if item["is_correct"] else "?"
                     st.markdown(f"**{status} {index}. {item['question']}**")
                     st.caption(f"إجابتك: {item['your_answer']} · الصحيح: {item['correct_answer']}")
                     st.write(item["explanation"])

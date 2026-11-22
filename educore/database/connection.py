@@ -27,8 +27,16 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 # ── Sync engine (Celery workers) ────────────────────────────────────
+sync_database_url = settings.DATABASE_URL_SYNC
+# SQLAlchemy 2.1 defaults ``postgresql://`` to psycopg 3, while this project
+# declares psycopg2-binary as its synchronous PostgreSQL driver.
+if sync_database_url.startswith("postgresql://"):
+    sync_database_url = sync_database_url.replace(
+        "postgresql://", "postgresql+psycopg2://", 1
+    )
+
 sync_engine = create_engine(
-    settings.DATABASE_URL_SYNC,
+    sync_database_url,
     echo=False,
     pool_size=5,
     max_overflow=10,

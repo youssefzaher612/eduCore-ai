@@ -14,6 +14,9 @@ def generate_student_report(
     if not isinstance(request, ReportRequest):
         request = ReportRequest.model_validate(request)
 
+    if not request.student_id:
+        raise ValueError("student_id is required to generate an individual student report.")
+
     student = next(
         (
             item

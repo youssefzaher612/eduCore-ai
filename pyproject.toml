@@ -2,7 +2,7 @@
 name = "educore"
 version = "1.0.0"
 description = "EduCore — A complete RAG system for education with Student and Teacher sections"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     # Web framework
     "fastapi>=0.115.0",
@@ -18,8 +18,10 @@ dependencies = [
     "pgvector>=0.3.0",
     "alembic>=1.13.0",
 
-    # LLM (OpenRouter uses the OpenAI-compatible API)
+    # Text LLM and Gemini image understanding
     "openai>=1.50.0",
+    "google-genai>=1.0.0",
+    "Pillow>=10.0.0",
 
     # Embeddings (local, free)
     "sentence-transformers>=3.0.0",

@@ -139,7 +139,8 @@ class LessonVerifier:
             try:
                 partial = verifier.verify(lesson, request)
             except Exception as exc:
-                logger.exception("verifier %s crashed", name)
+                logger.warning("lesson verification_task=%s stage=failed error_category=%s",
+                               name, type(exc).__name__)
                 outcome.ran.append(name)
                 outcome.errors[name] = f"{type(exc).__name__}: {exc}"[:300]
                 outcome.report.add(Issue(

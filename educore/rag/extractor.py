@@ -12,12 +12,64 @@ import io
 import logging
 import os
 import shutil
+import hashlib
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 
 from educore.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class DocumentExtractionCache:
+    """Bounded, process-local cache for extracted document pages."""
+
+    def __init__(self, max_entries: int = 32, max_chars: int = 8_000_000, ttl_seconds: int = 3600):
+        self.max_entries = max_entries
+        self.max_chars = max_chars
+        self.ttl_seconds = ttl_seconds
+        self._items: OrderedDict[str, tuple[float, tuple[tuple[str, int, dict], ...], int]] = OrderedDict()
+        self._char_count = 0
+        self._lock = RLock()
+
+    @staticmethod
+    def _copy(pages: tuple[tuple[str, int, dict], ...]) -> list["ExtractedPage"]:
+        return [ExtractedPage(text, page, dict(metadata)) for text, page, metadata in pages]
+
+    def get(self, key: str) -> list["ExtractedPage"] | None:
+        now = time.monotonic()
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                return None
+            expires_at, pages, chars = item
+            if expires_at <= now:
+                self._items.pop(key, None)
+                self._char_count -= chars
+                return None
+            self._items.move_to_end(key)
+            return self._copy(pages)
+
+    def put(self, key: str, pages: list["ExtractedPage"]) -> None:
+        frozen = tuple((page.text, page.page_number, dict(page.metadata)) for page in pages)
+        chars = sum(len(page[0]) for page in frozen)
+        if not frozen or chars > self.max_chars:
+            return
+        with self._lock:
+            previous = self._items.pop(key, None)
+            if previous:
+                self._char_count -= previous[2]
+            self._items[key] = (time.monotonic() + self.ttl_seconds, frozen, chars)
+            self._char_count += chars
+            while len(self._items) > self.max_entries or self._char_count > self.max_chars:
+                _, (_, _, evicted_chars) = self._items.popitem(last=False)
+                self._char_count -= evicted_chars
+
+
+document_extraction_cache = DocumentExtractionCache()
 
 
 @dataclass
@@ -34,7 +86,9 @@ class DocumentExtractor:
     SUPPORTED_TYPES = {"pdf", "txt", "md", "csv", "xlsx"}
 
     @classmethod
-    def extract(cls, file_path: str, file_type: str) -> list[ExtractedPage]:
+    def extract(
+        cls, file_path: str, file_type: str, *, cache_scope: str | None = None
+    ) -> list[ExtractedPage]:
         """
         Extract text from a file.
 
@@ -63,7 +117,20 @@ class DocumentExtractor:
             "xlsx": cls._extract_xlsx,
         }[file_type]
 
-        pages = handler(file_path)
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        scope = cache_scope or str(Path(file_path).resolve())
+        cache_key = hashlib.sha256(
+            f"{scope}\0{file_type}\0{digest.hexdigest()}".encode("utf-8")
+        ).hexdigest()
+        pages = document_extraction_cache.get(cache_key)
+        if pages is None:
+            pages = handler(file_path)
+            document_extraction_cache.put(cache_key, pages)
+        else:
+            logger.info("Document extraction cache hit for scope %s", scope)
         logger.info("Extracted %d pages from %s (%s)", len(pages), file_path, file_type)
         return pages
 
@@ -74,14 +141,16 @@ class DocumentExtractor:
 
         pages = []
         ocr_config = None
+        ocr_pages_processed = 0
         with pymupdf.open(file_path) as doc:
             for page_num, page in enumerate(doc, start=1):
                 text = page.get_text("text")
                 has_text = bool(text.strip())
 
-                # Image-only scans have no text layer. Also OCR image-heavy pages
-                # with only a small text layer so labels inside figures are kept.
-                if not has_text or (len(text.strip()) < 40 and page.get_images(full=True)):
+                # OCR only image/scanned pages with no selectable text. The demo cap
+                # limits OCR work, but every page is still checked for a text layer.
+                if not has_text and ocr_pages_processed < settings.OCR_MAX_PAGES:
+                    ocr_pages_processed += 1
                     if ocr_config is None:
                         ocr_config = DocumentExtractor._prepare_ocr(pymupdf)
                     try:
@@ -101,6 +170,14 @@ class DocumentExtractor:
 
                     if len(ocr_text.strip()) > len(text.strip()):
                         text = ocr_text
+                elif not has_text and settings.OCR_MAX_PAGES == 0:
+                    logger.info("OCR is disabled by OCR_MAX_PAGES=0; skipping PDF page %d", page_num)
+                elif not has_text and ocr_pages_processed >= settings.OCR_MAX_PAGES:
+                    logger.info(
+                        "OCR page limit reached (%d); skipping scanned PDF page %d",
+                        settings.OCR_MAX_PAGES,
+                        page_num,
+                    )
 
                 if text.strip():
                     pages.append(ExtractedPage(

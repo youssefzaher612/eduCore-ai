@@ -374,7 +374,7 @@ def run_deterministic_checks(lesson: dict, request) -> list:
             function = globals()[name]
             function(lesson, out, request) if needs_request else function(lesson, out)
         except Exception as exc:
-            logger.exception("quality check %s failed", name)
+            logger.warning("lesson quality_check=%s stage=failed error_category=%s", name, type(exc).__name__)
             out.append(_issue(INFO, "quality.check_error",
                               f"An automatic quality check ({name.lstrip('_')}) could not run ({type(exc).__name__}).", ()))
     return out

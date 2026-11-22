@@ -80,7 +80,7 @@ class LessonRequest(BaseModel):
     ] = "Interactive"
 
     # Assessment preferences
-    question_count: int = Field(default=5, ge=1, le=20)
+    question_count: int = Field(default=3, ge=1, le=20)
 
     # Optional teacher instructions (treated as untrusted text by the prompts)
     extra_instructions: Annotated[
@@ -151,6 +151,17 @@ def _difficulty(value):
         if cleaned in DIFFICULTY_LABELS:
             return cleaned
     raise ValueError("must be exactly one of: Basic, Intermediate, Advanced")
+
+
+def _normalized_difficulty(value, default="Basic"):
+    if isinstance(value, str):
+        aliases = {
+            "basic": "Basic", "easy": "Basic", "beginner": "Basic",
+            "intermediate": "Intermediate", "medium": "Intermediate",
+            "advanced": "Advanced", "hard": "Advanced", "challenging": "Advanced",
+        }
+        return aliases.get(value.strip().casefold(), default)
+    return default
 
 
 def _strict_bool(value):
@@ -394,6 +405,118 @@ class GeneratedLesson(_Model):
     post_lesson_reflection: TextList
 
 
+class LessonSectionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+    key_points: list[str] = Field(default_factory=list)
+    examples: list[str] = Field(default_factory=list)
+
+
+class LessonActivityOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    activity_title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    estimated_duration: int = Field(ge=1)
+    learning_objective: str = Field(min_length=1)
+
+
+class LessonAssessmentQuestionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    question_id: str = Field(min_length=1)
+    question_type: Literal["short_answer"] = "short_answer"
+    question_text: str = Field(min_length=1)
+    expected_answer: str = Field(min_length=1)
+    explanation: str = ""
+
+
+class LessonPlan(BaseModel):
+    """API/export lesson plan shape; the detailed teacher lesson remains the UI contract."""
+    model_config = ConfigDict(extra="forbid")
+    lesson_title: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    grade_level: str = Field(min_length=1)
+    learning_objectives: list[str] = Field(min_length=1)
+    prerequisites: list[str] = Field(default_factory=list)
+    estimated_duration: int = Field(ge=1)
+    introduction: str = Field(min_length=1)
+    lesson_sections: list[LessonSectionOutput] = Field(min_length=1)
+    teaching_activities: list[LessonActivityOutput] = Field(default_factory=list)
+    examples: list[str] = Field(default_factory=list)
+    assessment_questions: list[LessonAssessmentQuestionOutput] = Field(default_factory=list)
+    homework: list[str] = Field(default_factory=list)
+    summary: str = Field(min_length=1)
+
+
+def adapt_generated_lesson_to_plan(lesson: dict, request: LessonRequest) -> LessonPlan:
+    """Map the rich lesson contract to a concise, independently validated plan."""
+    objectives = [item.get("objective", "") for item in lesson.get("learning_objectives", [])]
+    stages = lesson.get("lesson_flow", [])
+    first_stage = stages[0] if stages else {}
+    scripts = first_stage.get("teacher_script", [])
+    introduction = (scripts[0].get("say", "") if scripts else "") or " ".join(first_stage.get("teacher_actions", []))
+
+    sections = []
+    for concept in lesson.get("concept_explanations", []):
+        steps = concept.get("step_by_step_explanation", [])
+        key_points = [
+            (item.get("teacher_explanation", "") if isinstance(item, dict) else str(item))
+            for item in steps
+        ]
+        explanation = concept.get("teacher_script", "") or " ".join(key_points)
+        if not explanation:
+            continue
+        sections.append(LessonSectionOutput(
+            title=concept.get("concept", "Concept"), explanation=explanation,
+            key_points=[item for item in key_points if item],
+            examples=[item for item in concept.get("board_work", []) if item],
+        ))
+
+    objective = objectives[0] if objectives else "Apply the lesson's central idea."
+    activities = []
+    raw_activities = lesson.get("classroom_activities", [])
+    if raw_activities:
+        for item in raw_activities:
+            description = item.get("student_task", "") or " ".join(item.get("instructions", []))
+            activities.append(LessonActivityOutput(
+                activity_title=item.get("activity_name", "Class activity"),
+                description=description or item.get("expected_result", "Practice the target skill."),
+                estimated_duration=max(1, int(item.get("duration_minutes", 1))),
+                learning_objective=item.get("learning_goal", "") or objective,
+            ))
+    else:
+        for stage in stages:
+            description = " ".join(stage.get("teacher_actions", []) + stage.get("student_actions", []))
+            activities.append(LessonActivityOutput(
+                activity_title=stage.get("stage", "Lesson activity"),
+                description=description or stage.get("purpose", "Practice the target skill."),
+                estimated_duration=max(1, int(stage.get("duration_minutes", 1))),
+                learning_objective=objective,
+            ))
+
+    examples = [
+        f"{item.get('title', 'Example')}: {item.get('problem', '')} Answer: {item.get('final_answer', '')}"
+        for item in lesson.get("worked_examples", [])
+    ]
+    questions = [
+        LessonAssessmentQuestionOutput(
+            question_id=f"lesson_question_{index}", question_text=item.get("question", ""),
+            expected_answer=item.get("correct_answer", ""), explanation=item.get("explanation", ""),
+        )
+        for index, item in enumerate(lesson.get("practice_questions", []), start=1)
+    ]
+    homework = [item.get("question", "") for item in lesson.get("homework", []) if item.get("question")]
+    takeaways = lesson.get("lesson_summary", {}).get("key_takeaways", [])
+    return LessonPlan(
+        lesson_title=lesson.get("lesson_title", request.topic), subject=request.subject,
+        grade_level=request.grade, learning_objectives=objectives,
+        prerequisites=[item.get("knowledge", "") for item in lesson.get("prerequisites", []) if item.get("knowledge")],
+        estimated_duration=request.duration_minutes, introduction=introduction or request.topic,
+        lesson_sections=sections, teaching_activities=activities, examples=examples,
+        assessment_questions=questions, homework=homework, summary=" ".join(takeaways),
+    )
+
+
 REQUIRED_SECTIONS = tuple(GeneratedLesson.model_fields.keys())
 
 
@@ -466,10 +589,204 @@ def format_validation_error(exc: ValidationError) -> list:
     return problems
 
 
+def _normalize_lesson_dict(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return data
+
+    if "lesson_title" not in data or not data["lesson_title"]:
+        data["lesson_title"] = data.get("title") or (data.get("lesson_overview") or {}).get("title") or "Lesson Plan"
+
+    if "lesson_overview" not in data or not isinstance(data["lesson_overview"], dict):
+        data["lesson_overview"] = {
+            "central_idea": str(data.get("topic") or "Core Topic Concepts"),
+            "expected_outcome": "Students will understand and apply the topic concepts.",
+        }
+    else:
+        lo = data["lesson_overview"]
+        if not lo.get("central_idea"):
+            lo["central_idea"] = str(data.get("topic") or "Core Topic Concepts")
+        if not lo.get("expected_outcome"):
+            lo["expected_outcome"] = "Students will understand and apply the topic concepts."
+
+    if not data.get("learning_objectives"):
+        data["learning_objectives"] = [{"objective": f"Understand the fundamentals of {data.get('lesson_title', 'the topic')}."}]
+
+    if "prerequisites" not in data or not isinstance(data["prerequisites"], list):
+        data["prerequisites"] = []
+
+    if "teacher_learning" not in data or not isinstance(data["teacher_learning"], dict):
+        data["teacher_learning"] = {
+            "include": True,
+            "foundations": [],
+            "teacher_examples": [],
+            "knowledge_warnings": [],
+        }
+    else:
+        tl = data["teacher_learning"]
+        if "include" not in tl:
+            tl["include"] = True
+        if "foundations" not in tl or not isinstance(tl["foundations"], list):
+            tl["foundations"] = []
+        if "teacher_examples" not in tl or not isinstance(tl["teacher_examples"], list):
+            tl["teacher_examples"] = []
+        if "knowledge_warnings" not in tl or not isinstance(tl["knowledge_warnings"], list):
+            tl["knowledge_warnings"] = []
+
+    if "teaching_strategy" not in data or not isinstance(data["teaching_strategy"], dict):
+        data["teaching_strategy"] = {
+            "recommended_approach": "Guided instruction with interactive checks",
+            "pedagogical_reason": "Allows students to grasp fundamental concepts step by step.",
+        }
+    else:
+        ts = data["teaching_strategy"]
+        if "recommended_approach" not in ts or not ts["recommended_approach"]:
+            ts["recommended_approach"] = ts.get("approach") or "Guided instruction with interactive checks"
+
+    # Normalize lesson_flow
+    stages = data.get("lesson_flow")
+    if not stages or not isinstance(stages, list):
+        data["lesson_flow"] = [
+            {"stage": "Introduction", "duration_minutes": 10, "teacher_actions": ["Introduce key concepts."], "student_actions": ["Listen and take notes."]},
+            {"stage": "Core Teaching & Practice", "duration_minutes": 25, "teacher_actions": ["Explain concepts and guide practice."], "student_actions": ["Engage and solve examples."]},
+            {"stage": "Wrap Up & Review", "duration_minutes": 10, "teacher_actions": ["Summarize key takeaways."], "student_actions": ["Review and ask questions."]},
+        ]
+    else:
+        for s in stages:
+            if not isinstance(s, dict):
+                continue
+            if "stage" not in s or not s["stage"]:
+                s["stage"] = s.get("stage_name") or "Lesson Stage"
+            if "duration_minutes" not in s or not s["duration_minutes"]:
+                s["duration_minutes"] = 10
+            for act_field in ("teacher_actions", "student_actions"):
+                val = s.get(act_field)
+                if isinstance(val, str):
+                    s[act_field] = [val]
+                elif not isinstance(val, list):
+                    s[act_field] = ["Participate actively."]
+
+    # Normalize concept_explanations
+    concepts = data.get("concept_explanations")
+    if not concepts or not isinstance(concepts, list):
+        data["concept_explanations"] = [
+            {"concept": str(data.get("lesson_title") or "Core Topic"), "teacher_script": "Explain the core ideas and definitions clearly."}
+        ]
+    else:
+        for c in concepts:
+            if not isinstance(c, dict):
+                continue
+            if "concept" not in c or not c["concept"]:
+                c["concept"] = c.get("concept_name") or "Core Concept"
+            if not c.get("teacher_script") and not c.get("step_by_step_explanation"):
+                c["teacher_script"] = c.get("explanation") or "Explain the concept thoroughly to the students."
+
+    # Normalize worked_examples
+    examples = data.get("worked_examples")
+    if not examples or not isinstance(examples, list):
+        data["worked_examples"] = [
+            {
+                "title": "Worked Demonstration",
+                "difficulty": "Basic",
+                "problem": "Sample problem demonstrating the key concept.",
+                "solution_steps": [{"work": "Identify the key components."}, {"work": "Apply the rule step by step."}],
+                "final_answer": "Complete worked solution.",
+            }
+        ]
+    else:
+        for ex in examples:
+            if not isinstance(ex, dict):
+                continue
+            if "title" not in ex or not ex["title"]:
+                ex["title"] = ex.get("example_title") or "Worked Example"
+            ex["difficulty"] = _normalized_difficulty(ex.get("difficulty"))
+            if "problem" not in ex or not ex["problem"]:
+                ex["problem"] = ex.get("problem_statement") or "Sample problem."
+            if not ex.get("solution_steps"):
+                ex["solution_steps"] = [{"work": "Step 1: Understand problem."}, {"work": "Step 2: Apply concept."}]
+            if "final_answer" not in ex or not ex["final_answer"]:
+                ex["final_answer"] = "Final solution derived from steps."
+
+    for list_field in (
+        "classroom_interaction", "classroom_activities", "common_misconceptions",
+        "formative_assessment", "homework", "teacher_notes", "post_lesson_reflection"
+    ):
+        if list_field not in data or not isinstance(data[list_field], list):
+            data[list_field] = []
+
+    # Normalize practice_questions
+    pqs = data.get("practice_questions")
+    if not pqs or not isinstance(pqs, list):
+        data["practice_questions"] = [
+            {
+                "question": "Explain the main concept in your own words with an example.",
+                "difficulty": "Basic",
+                "correct_answer": "Accurate explanation demonstrating understanding.",
+                "explanation": "Tests core conceptual understanding.",
+                "step_by_step_solution": ["State definition", "Provide an example"],
+            }
+        ]
+    else:
+        for q in pqs:
+            if not isinstance(q, dict):
+                continue
+            if "question" not in q or not q["question"]:
+                q["question"] = q.get("question_text") or "Practice problem on the topic."
+            q["difficulty"] = _normalized_difficulty(q.get("difficulty"))
+            if not q.get("correct_answer"):
+                q["correct_answer"] = "Model answer showing correct application."
+            if not q.get("explanation"):
+                q["explanation"] = "Standard explanation for the correct answer."
+            if not q.get("step_by_step_solution"):
+                q["step_by_step_solution"] = ["Step 1: Read carefully", "Step 2: Solve step by step"]
+            elif isinstance(q["step_by_step_solution"], list):
+                normalized_steps = []
+                for step in q["step_by_step_solution"]:
+                    if not isinstance(step, dict):
+                        normalized_steps.append(step)
+                        continue
+                    parts = [
+                        str(step[key]).strip()
+                        for key in ("step", "work", "teacher_explanation", "reasoning")
+                        if isinstance(step.get(key), (str, int, float))
+                        and not isinstance(step.get(key), bool)
+                        and str(step[key]).strip()
+                    ]
+                    normalized_steps.append(" — ".join(parts) if parts else step)
+                q["step_by_step_solution"] = normalized_steps
+
+    if "lesson_summary" not in data or not isinstance(data["lesson_summary"], dict):
+        data["lesson_summary"] = {
+            "key_takeaways": ["Understand definition and main components.", "Review practical examples."],
+            "teacher_closing_script": "Great job today, review your notes for next time.",
+        }
+    else:
+        ls = data["lesson_summary"]
+        if not ls.get("key_takeaways"):
+            ls["key_takeaways"] = ["Review core lecture concepts."]
+
+    for homework in data.get("homework", []):
+        if isinstance(homework, dict):
+            homework["difficulty"] = _normalized_difficulty(homework.get("difficulty"))
+
+    if "differentiation" not in data or not isinstance(data["differentiation"], dict):
+        data["differentiation"] = {
+            "students_needing_support": ["Provide additional worked examples."],
+            "students_at_expected_level": ["Complete standard practice questions."],
+            "advanced_students": ["Explore deeper extension problems."],
+        }
+    else:
+        diff = data["differentiation"]
+        if not diff.get("students_needing_support") and not diff.get("students_at_expected_level") and not diff.get("advanced_students"):
+            diff["students_at_expected_level"] = ["Complete standard practice questions."]
+
+    return data
+
+
 def parse_generated_lesson(data: Any) -> dict:
     """Validate ``data`` and return the normalised lesson as a plain dict."""
     if not isinstance(data, dict):
         raise LessonSchemaError([SchemaProblem((), "The generated lesson must be a JSON object.")])
+    data = _normalize_lesson_dict(data)
     try:
         model = GeneratedLesson.model_validate(data)
     except ValidationError as exc:

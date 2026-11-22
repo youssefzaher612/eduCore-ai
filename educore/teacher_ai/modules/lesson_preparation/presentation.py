@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from educore.teacher_ai.core import config
 from educore.teacher_ai.core.config import ConfigurationError
 from educore.teacher_ai.core.llm_client import (LLMAuthenticationError, LLMConfigurationError, LLMConnectionError,
                              LLMError, LLMRateLimitError, LLMRequestError, LLMTimeoutError,
@@ -154,25 +155,29 @@ def friendly_error(exc: BaseException):
 
     if isinstance(exc, LLMConfigurationError):
         return ("Setup needed", exc.message,
-                "Add OPENROUTER_API_KEY to EduCore's .env file, then restart the app.")
+                f"Add {config.settings.LLM_PROVIDER.upper()}_API_KEY to EduCore's .env file, then restart the app.")
     if isinstance(exc, LLMAuthenticationError):
         return ("The AI service rejected the API key", exc.message,
-                "Check OPENROUTER_API_KEY in your .env file.")
+                f"Check {config.settings.LLM_PROVIDER.upper()}_API_KEY in your .env file.")
     if isinstance(exc, LLMRateLimitError):
         wait = exc.retry_after
         if wait and wait >= 60:
             minutes = int(wait // 60)
             seconds = int(wait % 60)
             return (
-                "OpenRouter's free model limit has been reached",
+                "Groq's temporary TPM/RPM request limit has been reached",
                 f"The provider asked EduCore to wait about {minutes}m {seconds}s before another request.",
-                "Wait for the quota reset or select another available free model. Repeated retries before then will fail.",
+                "The fast Groq model was tried as fallback. Wait for the quota reset before retrying.",
             )
-        return ("The AI service is busy", exc.message, "Wait briefly and try again.")
+        return (
+            "Groq's temporary TPM/RPM request limit has been reached",
+            exc.message,
+            "Wait briefly for the quota window to reset, then try again.",
+        )
     if isinstance(exc, LLMTruncatedError):
         return ("The lesson was too long to finish",
                 "The AI ran out of space before it completed the lesson.",
-                "Try a shorter duration, fewer practice questions, or raise OPENROUTER_GENERATION_MAX_TOKENS.")
+                "Try a shorter duration or fewer practice questions, then generate the lesson again.")
     if isinstance(exc, (LLMTimeoutError, LLMConnectionError)):
         return ("Could not reach the AI service", exc.message, "Check your internet connection and try again.")
     if isinstance(exc, LLMRequestError):

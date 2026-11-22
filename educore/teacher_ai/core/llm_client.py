@@ -1,5 +1,5 @@
 """
-OpenRouter LLM client for EduCore teacher tools.
+Groq LLM client for EduCore teacher tools with a Groq-only model fallback.
 
 Public interface
 ----------------
@@ -13,21 +13,16 @@ Public interface
 
 Behaviour
 ---------
-* The SDK client is created lazily, so importing this module needs no API key.
-* The SDK's own retries are disabled (max_retries=0); this class owns the retry
-  policy so that the number of calls is predictable and observable.
-* Only retryable failures are retried: timeouts, connection errors, HTTP 408/409,
-  429 (when the requested wait is short), 5xx, and an empty response.
-  Authentication, bad-request, request-too-large and not-found errors are
-  permanent and raised immediately.
-* finish_reason == "length" means the output was cut off at the token limit. It
-  raises LLMTruncatedError and is never retried unchanged, because the same
-  request would be cut off again.
+* Lazy SDK client creation for the configured Groq endpoint.
+* Model fallback cascade: primary Groq model -> fast Groq model.
+* Safe JSON extraction: handles markdown code fences and cleans JSON text.
+* Graceful fallback when response_format={"type": "json_object"} is unsupported.
 * Error text and logs are redacted: API keys never appear in them.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
@@ -35,7 +30,10 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional
 
+from openai import OpenAI
+
 from educore.teacher_ai.core import config
+from educore.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +41,9 @@ _SECRET_PATTERNS = (
     re.compile(r"gsk_[A-Za-z0-9_\-]{8,}"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{8,}"),
 )
+
+# Approved Groq fallback model for teacher AI.
+_FALLBACK_MODELS = [settings.GROQ_FAST_MODEL] if settings.active_provider == "groq" else []
 
 
 def redact(text: Any, extra_secrets: tuple = (), limit: int = 600) -> str:
@@ -54,6 +55,35 @@ def redact(text: Any, extra_secrets: tuple = (), limit: int = 600) -> str:
     for pattern in _SECRET_PATTERNS:
         value = pattern.sub("[REDACTED]", value)
     return value if len(value) <= limit else value[:limit] + "..."
+
+
+def clean_json_text(text: str) -> str:
+    """Extract clean JSON substring from model output, stripping markdown fences or commentary."""
+    if not isinstance(text, str):
+        return ""
+    cleaned = text.strip()
+    # 1. Try finding balanced { ... } that parses validly
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start : end + 1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            pass
+
+    # 2. Strip code fences
+    cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\n?```$", "", cleaned, flags=re.MULTILINE)
+    cleaned = cleaned.strip()
+
+    # 3. If balanced braces exist after stripping fences, return candidate
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return cleaned[start : end + 1]
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +202,7 @@ def parse_retry_after(headers: Any, message: str = "") -> Optional[float]:
     """Seconds to wait, from a Retry-After header or the provider's message text."""
     try:
         raw = headers.get("retry-after") if headers is not None else None
-    except Exception:  # headers object of an unexpected type
+    except Exception:
         raw = None
     if raw is not None:
         try:
@@ -202,7 +232,9 @@ def _int_or_none(value: Any) -> Optional[int]:
 
 
 class LLMClient:
-    """Thin, well-behaved wrapper around OpenRouter chat completions."""
+    """Thin, well-behaved wrapper around Groq with a Groq model fallback."""
+
+    _groq_blocked_until: float = 0.0
 
     def __init__(
         self,
@@ -221,7 +253,7 @@ class LLMClient:
         rng: Callable[[], float] = random.random,
     ):
         self._api_key = api_key
-        self.model = model or config.OPENROUTER_MODEL
+        self.model = model or settings.active_chat_model
         self._sdk = sdk_client
         self.max_retries = config.OPENROUTER_MAX_RETRIES if max_retries is None else max_retries
         self.base_delay = config.OPENROUTER_RETRY_BASE_DELAY if base_delay is None else base_delay
@@ -235,9 +267,10 @@ class LLMClient:
         self.json_mode = config.OPENROUTER_JSON_MODE if json_mode is None else json_mode
         self._sleep = sleep
         self._rng = rng
-        # OpenRouter recommends max_completion_tokens; retain a compatibility
-        # fallback for older SDK versions.
-        self._token_param = "max_completion_tokens"
+        self._token_param = (
+            "max_tokens" if settings.active_provider == "ollama"
+            else "max_completion_tokens"
+        )
 
     # -- SDK access ---------------------------------------------------------
     def _secrets(self) -> tuple:
@@ -248,7 +281,7 @@ class LLMClient:
             key = self._api_key or config.require_openrouter_api_key()
             if not key or not key.strip():
                 raise LLMConfigurationError(
-                    "OPENROUTER_API_KEY is missing. Add it to EduCore's .env file."
+                    f"{settings.active_provider.upper()} configuration is missing. Check EduCore's .env file and local AI service."
                 )
             try:
                 from educore.provider import create_sync_client
@@ -264,15 +297,18 @@ class LLMClient:
     # -- Public API ---------------------------------------------------------
     def generate(self, system_prompt: str, user_prompt: str,
                  temperature: float = 0.4, max_tokens: Optional[int] = None,
-                 *, model: Optional[str] = None) -> str:
-        """Return the text of a complete response (see module docstring)."""
+                 *, model: Optional[str] = None,
+                 response_format: Optional[dict] = None) -> str:
+        """Return the text of a complete response."""
         return self.generate_detailed(
-            system_prompt, user_prompt, temperature, max_tokens, model=model
+            system_prompt, user_prompt, temperature, max_tokens, model=model,
+            response_format=response_format,
         ).content
 
     def generate_detailed(self, system_prompt: str, user_prompt: str,
                           temperature: float = 0.4, max_tokens: Optional[int] = None,
-                          *, model: Optional[str] = None) -> LLMResponse:
+                          *, model: Optional[str] = None,
+                          response_format: Optional[dict] = None) -> LLMResponse:
         if not isinstance(system_prompt, str) or not system_prompt.strip():
             raise ValueError("system_prompt must be a non-empty string.")
         if not isinstance(user_prompt, str) or not user_prompt.strip():
@@ -281,77 +317,134 @@ class LLMClient:
         requested = config.OPENROUTER_GENERATION_MAX_TOKENS if max_tokens is None else int(max_tokens)
         if requested < 1:
             raise ValueError("max_tokens must be a positive integer.")
-        limit = min(requested, self.model_max_completion_tokens)
-        if limit < requested:
-            logger.warning("max_tokens %s exceeds the model limit; using %s.", requested, limit)
+        limit = min(requested, self.model_max_completion_tokens, 4096)
         temp = max(0.0, min(float(temperature), config.MAX_TEMPERATURE))
-        model_name = model or self.model
+        primary_model = model or self.model
+
+        # Try the primary Groq model and then the approved fast Groq model.
+        now = time.monotonic()
+        active_provider = settings.active_provider
+        # A recent primary-model rate limit should skip that model, not disable
+        # the whole cascade. The configured fast Groq model remains eligible.
+        cascade: list[tuple[str, str]] = []
+        if active_provider != "groq" or now >= LLMClient._groq_blocked_until:
+            cascade.append((active_provider, primary_model))
+        for fb in _FALLBACK_MODELS:
+            if fb != primary_model:
+                cascade.append((active_provider, fb))
 
         started = time.monotonic()
-        total_attempts = self.max_retries + 1
-        for attempt in range(1, total_attempts + 1):
+        last_error: Optional[Exception] = None
+
+        for attempt, (provider, model_name) in enumerate(cascade, start=1):
             try:
-                raw = self._call(model_name, system_prompt, user_prompt, temp, limit)
+                raw = self._call_provider(
+                    provider, model_name, system_prompt, user_prompt, temp, limit,
+                    response_format=response_format,
+                )
                 response = self._to_response(raw, model_name, limit)
-            except LLMError as exc:
-                error = exc
-            except Exception as exc:  # SDK / transport exceptions
-                error = self._classify(exc)
-            else:
                 response.attempts = attempt
                 response.latency_seconds = round(time.monotonic() - started, 3)
                 logger.info(
-                    "LLM call ok: model=%s finish=%s prompt_tokens=%s completion_tokens=%s attempts=%s latency=%.1fs",
-                    response.model, response.finish_reason, response.prompt_tokens,
-                    response.completion_tokens, attempt, response.latency_seconds,
+                    "Teacher LLM call ok: provider=%s model=%s tokens=%s attempts=%s latency=%.1fs",
+                    provider, response.model, response.completion_tokens, attempt, response.latency_seconds,
                 )
                 return response
+            except LLMTruncatedError:
+                raise
+            except (LLMError, Exception) as exc:
+                last_error = exc
+                classified = self._classify(exc) if not isinstance(exc, LLMError) else exc
+                err_text = str(classified.message).lower()
+                if "free-models-per-day" in err_text or "daily_limit" in err_text or (isinstance(classified, LLMRateLimitError) and provider == active_provider):
+                    LLMClient._groq_blocked_until = time.monotonic() + 300
+                logger.warning(
+                    "Teacher AI call failed on %s/%s (%s): %s. Trying the next configured model...",
+                    provider, model_name, type(classified).__name__, redact(classified.message, self._secrets())
+                )
+                # Small jitter before next attempt
+                if attempt < len(cascade):
+                    self._sleep(0.5)
 
-            if not error.retryable or attempt == total_attempts:
-                logger.warning("LLM call failed (%s) after %s attempt(s): %s",
-                               type(error).__name__, attempt, redact(error.message, self._secrets()))
-                raise error
-            delay = self._backoff(attempt, error.retry_after)
-            logger.info("LLM call retry %s/%s in %.1fs after %s", attempt, self.max_retries,
-                        delay, type(error).__name__)
-            self._sleep(delay)
-        raise LLMError("LLM call failed.")  # pragma: no cover - loop always returns or raises
+        logger.error("All teacher model providers exhausted: %s", last_error)
+        if last_error is None:
+            raise LLMServerError("The AI provider is temporarily unavailable. Please try again shortly.")
+        raise self._classify(last_error) if not isinstance(last_error, LLMError) else last_error
 
     # -- Internals ----------------------------------------------------------
-    def _backoff(self, attempt: int, retry_after: Optional[float]) -> float:
-        base = min(self.max_delay, self.base_delay * (2 ** (attempt - 1)))
-        delay = base + self._rng() * 0.25 * base
-        if retry_after is not None:
-            delay = max(delay, retry_after)
-        return delay
-
-    def _call(self, model: str, system_prompt: str, user_prompt: str,
-              temperature: float, max_tokens: int) -> Any:
+    def _call_provider(
+        self,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        response_format: Optional[dict] = None,
+    ) -> Any:
         sdk = self._get_sdk()
 
-        def build() -> dict:
-            kwargs = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": temperature,
-                self._token_param: max_tokens,
+        kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            self._token_param: max_tokens,
+        }
+        if provider == "ollama":
+            kwargs["extra_body"] = {
+                "options": {"num_ctx": settings.OLLAMA_NUM_CTX},
+                "keep_alive": settings.OLLAMA_KEEP_ALIVE,
             }
-            if self.json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-            return kwargs
 
-        try:
-            return sdk.chat.completions.create(**build())
-        except TypeError as exc:
-            # An old SDK may not know max_completion_tokens; retry once with max_tokens.
-            if self._token_param == "max_completion_tokens" and "max_completion_tokens" in str(exc):
-                logger.warning("SDK rejected max_completion_tokens; falling back to max_tokens.")
-                self._token_param = "max_tokens"
-                return sdk.chat.completions.create(**build())
-            raise
+        # Try with JSON mode first, then retry the same model without that
+        # constraint when Groq rejects its constrained decoder. Some Groq
+        # models/accounts return json_validate_failed with an empty generation.
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        elif self.json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        request_kwargs = dict(kwargs)
+        for _ in range(3):
+            try:
+                return sdk.chat.completions.create(**request_kwargs)
+            except Exception as exc:
+                err_str = str(exc).lower()
+                status = getattr(exc, "status_code", None)
+                body = getattr(exc, "body", None)
+                error_body = body.get("error", {}) if isinstance(body, dict) else {}
+                error_code = str(error_body.get("code", "")).casefold() if isinstance(error_body, dict) else ""
+                json_format_rejected = (
+                    error_code == "json_validate_failed"
+                    or "json_validate_failed" in err_str
+                    or "response_format" in err_str
+                    or "json_object" in err_str
+                )
+                if "response_format" in request_kwargs and json_format_rejected:
+                    logger.warning(
+                        "%s rejected structured response formatting (HTTP %s); retrying %s with JSON mode",
+                        provider,
+                        status or "unknown",
+                        model,
+                    )
+                    current_format = request_kwargs.get("response_format") or {}
+                    if current_format.get("type") == "json_schema":
+                        request_kwargs["response_format"] = {"type": "json_object"}
+                    else:
+                        request_kwargs.pop("response_format", None)
+                    continue
+                if "max_completion_tokens" in request_kwargs and "max_completion_tokens" in err_str:
+                    logger.warning("Provider rejected max_completion_tokens; retrying %s with max_tokens", model)
+                    self._token_param = "max_tokens"
+                    request_kwargs.pop("max_completion_tokens", None)
+                    request_kwargs["max_tokens"] = max_tokens
+                    continue
+                raise
+
+        raise RuntimeError("The provider rejected all compatible request formats.")
 
     def _to_response(self, raw: Any, requested_model: str, max_tokens: int) -> LLMResponse:
         choices = getattr(raw, "choices", None)
@@ -364,8 +457,14 @@ class LLMClient:
         usage = getattr(raw, "usage", None)
         completion_tokens = _int_or_none(getattr(usage, "completion_tokens", None))
 
+        raw_text = content if isinstance(content, str) else ""
+
+        # If JSON mode is enabled, clean the output so json.loads succeeds
+        if self.json_mode and raw_text.strip():
+            raw_text = clean_json_text(raw_text)
+
         response = LLMResponse(
-            content=content if isinstance(content, str) else "",
+            content=raw_text,
             finish_reason=finish if isinstance(finish, str) else None,
             model=getattr(raw, "model", None) or requested_model,
             prompt_tokens=_int_or_none(getattr(usage, "prompt_tokens", None)),
@@ -403,28 +502,26 @@ class LLMClient:
         if "Timeout" in name:
             return LLMTimeoutError("The AI service timed out.", detail=text)
         if "Connection" in name:
-            return LLMConnectionError("Could not connect to the AI service.", detail=text)
+            if settings.active_provider == "ollama":
+                message = "Could not connect to local Ollama. Make sure Ollama is running at OLLAMA_BASE_URL."
+            else:
+                message = f"Could not connect to {settings.active_provider}. Check its base URL and network, then try again."
+            return LLMConnectionError(message, detail=text)
         if status == 429:
             wait = parse_retry_after(headers, text)
-            if wait is not None and wait > self.max_retry_after:
-                return LLMRateLimitError(
-                    f"Rate limit reached; the provider asks to wait about {int(wait)}s. "
-                    "Try again later or check your plan limits.",
-                    status_code=status, detail=text, retry_after=wait, retryable=False)
             return LLMRateLimitError("Rate limit reached.", status_code=status,
                                      detail=text, retry_after=wait)
         if status in (401, 403):
             return LLMAuthenticationError(
-                "The AI service rejected the API key. Check OPENROUTER_API_KEY.",
+                f"The AI service rejected the configured credentials. Check {settings.active_provider.upper()} settings.",
                 status_code=status, detail=text)
         if status == 413:
             return LLMRequestError(
-                "The request was too large for the model or your plan's token limit. "
-                "Lower OPENROUTER_GENERATION_MAX_TOKENS or the lesson size.",
+                "The request was too large for the model or your plan's token limit.",
                 status_code=status, detail=text)
         if status in (400, 404, 422):
             return LLMRequestError(
-                f"The AI service rejected the request (HTTP {status}). Check the OpenRouter model ID and settings.",
+                f"The AI service rejected the request (HTTP {status}).",
                 status_code=status, detail=text)
         if status is not None and (status >= 500 or status in (408, 409)):
             return LLMServerError(f"The AI service had a temporary problem (HTTP {status}).",

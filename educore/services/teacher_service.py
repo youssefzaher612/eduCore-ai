@@ -67,7 +67,7 @@ class TeacherWorkspaceService:
             project_id,
             query=query,
             top_k=max(4, min(int(top_k), 12)),
-            min_score=min(settings.RETRIEVAL_MIN_SCORE, 0.12),
+            min_score=settings.RETRIEVAL_MIN_SCORE,
             document_id=document_id,
         )
 
@@ -150,11 +150,10 @@ class TeacherWorkspaceService:
         )
         statement = (
             select(StudentAttempt, StudentExam, User.name)
-            .join(StudentExam, StudentExam.id == StudentAttempt.exam_id)
+            .outerjoin(StudentExam, StudentExam.id == StudentAttempt.exam_id)
             .join(User, User.id == StudentAttempt.user_id)
             .where(
                 StudentAttempt.project_id == project_id,
-                StudentExam.status == "submitted",
             )
             .order_by(StudentExam.submitted_at.asc(), StudentAttempt.created_at.asc())
         )
@@ -163,7 +162,9 @@ class TeacherWorkspaceService:
 
         by_exam: dict[tuple[uuid.UUID, uuid.UUID], dict] = {}
         for attempt, exam, student_name in rows:
-            if document_id is not None:
+            if exam is None or exam.status != "submitted":
+                continue
+            if selected_document is not None:
                 citation_names = {
                     str(item.get("document_name", "")).casefold()
                     for item in (exam.citations or [])
