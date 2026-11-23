@@ -1,0 +1,63 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║              EduCore — Docker Compose Stack                     ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# Services: PostgreSQL+pgvector, RabbitMQ, Redis
+# Usage:    docker compose up -d
+#           Then run the app locally with: uvicorn educore.main:app
+
+services:
+  # ── PostgreSQL + pgvector ────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: educore-postgres
+    environment:
+      POSTGRES_DB: educore
+      POSTGRES_USER: educore
+      POSTGRES_PASSWORD: educore_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U educore"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── RabbitMQ (Celery broker) ─────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: educore-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # Management UI
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (Celery result backend) ────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: educore-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  rabbitmqdata:
+  redisdata:

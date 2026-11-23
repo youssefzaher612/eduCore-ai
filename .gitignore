@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+EduCore_backup/
+
+# Environment
+.env
+.venv/
+venv/
+
+# Storage
+storage/*
+!storage/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Sentence-transformers cache
+.cache/
+
+# Runtime logs
+*.log
+
